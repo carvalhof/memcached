@@ -18,7 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-
+#include <arpa/inet.h>
 #include "queue.h"
 
 #ifdef __sun
@@ -95,6 +95,10 @@ static unsigned int item_lock_hashpower;
  */
 static LIBEVENT_THREAD *threads;
 
+pthread_mutex_t global_mutex;
+pthread_cond_t global_cond;
+int ready = 0;
+
 /*
  * Number of worker threads that have finished setting themselves up.
  */
@@ -109,6 +113,7 @@ static void cq_push(CQ *cq, CQ_ITEM *item);
 
 static void thread_libevent_process(evutil_socket_t fd, short which, void *arg);
 static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg);
+int local_thread_socket(LIBEVENT_THREAD *me);
 
 /* item_lock() must be held for an item before any modifications to either its
  * associated hash bucket, or the structure itself.
@@ -380,7 +385,12 @@ static void create_worker(void *(*func)(void *), void *arg) {
     pthread_attr_t  attr;
     int             ret;
 
+    long unsigned int stack_size;
     pthread_attr_init(&attr);
+    pthread_attr_getstacksize(&attr, &stack_size);
+
+    stack_size |= 0x1;
+    pthread_attr_setstacksize(&attr, stack_size);
 
     if ((ret = pthread_create(&((LIBEVENT_THREAD*)arg)->thread_id, &attr, func, arg)) != 0) {
         fprintf(stderr, "Can't create thread: %s\n",
@@ -505,11 +515,120 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     thread_io_queue_add(me, IO_QUEUE_NONE, NULL, NULL);
 }
 
+int local_thread_socket(LIBEVENT_THREAD *me) {
+    int sfd;
+    int error;
+    int flags;
+    struct linger ling = {0, 0};
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+
+    if ((sfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1) {
+        return -1;
+    }
+
+    // if ((flags = fcntl(sfd, F_GETFL, 0)) < 0 || fcntl(sfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    //     perror("setting O_NONBLOCK");
+    //     close(sfd);
+    //     return -1;
+    // }
+
+    // setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
+    // error = setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+    // if (error != 0)
+    //     perror("setsockopt");
+
+    // error = setsockopt(sfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
+    // if (error != 0)
+    //     perror("setsockopt");
+
+    // error = setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
+    // if (error != 0)
+    //     perror("setsockopt");
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = inet_addr(settings.inter);
+    address.sin_port = htons(settings.port);
+
+    if (bind(sfd, (struct sockaddr *)&address, sizeof(address)) == -1) {
+        if (errno != EADDRINUSE) {
+            perror("bind()");
+            close(sfd);
+            return 1;
+        }
+        close(sfd);
+    }
+
+    if (listen(sfd, 1024) == -1) {
+        perror("listen()");
+        close(sfd);
+        return 1;
+    }
+
+    int listen_conn_add;
+    // For Demikernel, we must increase the FD
+    sfd = sfd * (me->lcore_idx + 1);
+    enum protocol bproto = negotiating_prot;
+    enum network_transport transport = tcp_transport;
+
+    if (!conn_new(sfd, conn_listening,
+                                            EV_READ | EV_PERSIST, 1,
+                                            transport, me->base, NULL, 0, bproto, me->lcore_idx)) {
+            fprintf(stderr, "failed to create listening connection\n");
+            exit(EXIT_FAILURE);
+    }
+
+    return 0;
+}
+
 /*
  * Worker thread: main event loop
  */
 static void *worker_libevent(void *arg) {
     LIBEVENT_THREAD *me = arg;
+
+    sleep(0);
+
+    {
+        // I need to wait to create the LibOS properly to start to create the new worker threads.
+        pthread_mutex_lock(&global_mutex);
+        ready = 1;
+        pthread_cond_signal(&global_cond);
+        pthread_mutex_unlock(&global_mutex);
+    }
+
+    {
+        while(1) {
+            pthread_mutex_lock(&me->demi_lock);
+
+            while(!me->demi_done) {
+                pthread_cond_wait(&me->demi_cond, &me->demi_lock);
+            }
+
+            if(me->demi_done == 1) {
+                pthread_mutex_unlock(&me->demi_lock);
+                break;
+            }
+        }
+    }
+
+// #if defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER >= 0x02000101
+//     struct event_config *ev_config;
+//     ev_config = event_config_new();
+//     event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
+//     me->base = event_base_new_with_config(ev_config);
+//     event_config_free(ev_config);
+// #else
+//     me->base = event_init();
+// #endif
+
+//     if (! me->base) {
+//         fprintf(stderr, "Can't allocate event base\n");
+//         exit(1);
+//     }
+
+    setup_thread(me);
+    local_thread_socket(me);
 
     /* Any per-thread setup can happen here; memcached_thread_init() will block until
      * all threads have finished initializing.
@@ -616,7 +735,7 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
             case queue_new_conn:
                 c = conn_new(item->sfd, item->init_state, item->event_flags,
                                    item->read_buffer_size, item->transport,
-                                   me->base, item->ssl, item->conntag, item->bproto);
+                                   me->base, item->ssl, item->conntag, item->bproto, me->lcore_idx);
                 if (c == NULL) {
                     if (IS_UDP(item->transport)) {
                         fprintf(stderr, "Can't listen for events on UDP socket\n");
@@ -770,14 +889,15 @@ select:
  */
 void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
                        int read_buffer_size, enum network_transport transport, void *ssl,
-                       uint64_t conntag, enum protocol bproto) {
+                       uint64_t conntag, enum protocol bproto, int lcore_idx) {
     CQ_ITEM *item = NULL;
     LIBEVENT_THREAD *thread;
 
-    if (!settings.num_napi_ids)
-        thread = select_thread_round_robin();
-    else
-        thread = select_thread_by_napi_id(sfd);
+    thread = threads + lcore_idx;
+    // if (!settings.num_napi_ids)
+    //     thread = select_thread_round_robin();
+    // else
+    //     thread = select_thread_by_napi_id(sfd);
 
     item = cqi_new(thread->ev_queue);
     if (item == NULL) {
@@ -786,6 +906,9 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
         fprintf(stderr, "Failed to allocate memory for connection object\n");
         return;
     }
+
+    // Update the sfd
+    sfd = sfd * (lcore_idx + 1);
 
     item->sfd = sfd;
     item->init_state = init_state;
@@ -1145,22 +1268,43 @@ void memcached_thread_init(int nthreads, void *arg) {
         exit(1);
     }
 
+    pthread_mutex_init(&global_mutex, NULL);
+    pthread_cond_init(&global_cond, NULL);
+
     for (i = 0; i < nthreads; i++) {
+        ready = 0;
+
+        threads[i].lcore_idx = i;
+        pthread_mutex_init(&threads[i].demi_lock, NULL);
+        pthread_cond_init(&threads[i].demi_cond, NULL);
+
+        create_worker(worker_libevent, &threads[i]);
+
+        pthread_mutex_lock(&global_mutex);
+        while (!ready) {
+            pthread_cond_wait(&global_cond, &global_mutex);
+        }
+        pthread_mutex_unlock(&global_mutex);
+
         memcached_thread_notify_init(&threads[i].n);
         memcached_thread_notify_init(&threads[i].ion);
 #ifdef EXTSTORE
         threads[i].storage = arg;
 #endif
         threads[i].thread_baseid = i;
-        setup_thread(&threads[i]);
+        // setup_thread(&threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats_state.reserved_fds += 5;
+        pthread_mutex_lock(&threads[i].demi_lock);
+        threads[i].demi_done = 1;
+        pthread_cond_signal(&threads[i].demi_cond);
+        pthread_mutex_unlock(&threads[i].demi_lock);
     }
 
-    /* Create threads after we've done all the libevent setup. */
-    for (i = 0; i < nthreads; i++) {
-        create_worker(worker_libevent, &threads[i]);
-    }
+    // /* Create threads after we've done all the libevent setup. */
+    // for (i = 0; i < nthreads; i++) {
+    //     create_worker(worker_libevent, &threads[i]);
+    // }
 
     /* Wait for all the threads to set themselves up before returning. */
     pthread_mutex_lock(&init_lock);

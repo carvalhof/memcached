@@ -755,6 +755,10 @@ typedef struct {
     uint32_t proxy_rng[4]; // fast per-thread rng for lua.
     // TODO: add ctx object so we can attach to queue.
 #endif
+    int             demi_done;
+    pthread_mutex_t demi_lock;
+    pthread_cond_t  demi_cond;
+    int             lcore_idx;
 } LIBEVENT_THREAD;
 
 /**
@@ -901,6 +905,9 @@ struct conn {
     ssize_t (*read)(conn  *c, void *buf, size_t count);
     ssize_t (*sendmsg)(conn *c, struct msghdr *msg, int flags);
     ssize_t (*write)(conn *c, void *buf, size_t count);
+
+    int demi_fd;
+    int lcore_idx;
 };
 
 /* array of conn structures, indexed by file descriptor */
@@ -954,7 +961,7 @@ io_queue_t *conn_io_queue_get(conn *c, int type);
 io_queue_cb_t *thread_io_queue_get(LIBEVENT_THREAD *t, int type);
 void conn_io_queue_return(io_pending_t *io);
 conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size,
-    enum network_transport transport, struct event_base *base, void *ssl, uint64_t conntag, enum protocol bproto);
+    enum network_transport transport, struct event_base *base, void *ssl, uint64_t conntag, enum protocol bproto, int lcore_idx);
 
 void conn_worker_readd(conn *c);
 extern int daemonize(int nochdir, int noclose);
@@ -970,6 +977,13 @@ extern int daemonize(int nochdir, int noclose);
 #include "trace.h"
 #include "hash.h"
 
+int server_socket(const char *interface,
+                         int port,
+                         enum network_transport transport,
+                         FILE *portnumber_file, bool ssl_enabled,
+                         uint64_t conntag,
+                         enum protocol bproto);
+
 /*
  * Functions such as the libevent-related calls that need to do cross-thread
  * communication in multithreaded mode (rather than actually doing the work
@@ -984,7 +998,7 @@ void proxy_reload_notify(LIBEVENT_THREAD *t);
 #endif
 void return_io_pending(io_pending_t *io);
 void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size,
-    enum network_transport transport, void *ssl, uint64_t conntag, enum protocol bproto);
+    enum network_transport transport, void *ssl, uint64_t conntag, enum protocol bproto, int lcore_idx);
 void sidethread_conn_close(conn *c);
 
 /* Lock wrappers for cache functions that are called from main loop. */

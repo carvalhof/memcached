@@ -132,11 +132,15 @@ enum transmit_result {
 /* Default methods to read from/ write to a socket */
 ssize_t tcp_read(conn *c, void *buf, size_t count) {
     assert (c != NULL);
+    if(c->demi_fd)
+        return read(c->demi_fd, buf, count);
     return read(c->sfd, buf, count);
 }
 
 ssize_t tcp_sendmsg(conn *c, struct msghdr *msg, int flags) {
     assert (c != NULL);
+    if(c->demi_fd)
+        return sendmsg(c->demi_fd, msg, flags);
     return sendmsg(c->sfd, msg, flags);
 }
 
@@ -239,7 +243,8 @@ static void settings_init(void) {
     /* By default this string should be NULL for getaddrinfo() */
     settings.inter = NULL;
     settings.maxbytes = 64 * 1024 * 1024; /* default is 64MB */
-    settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
+    // settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
+    settings.maxconns = 8192;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
     settings.oldest_live = 0;
     settings.oldest_cas = 0;          /* supplements accuracy of oldest_live */
@@ -647,7 +652,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
                 struct event_base *base, void *ssl, uint64_t conntag,
-                enum protocol bproto) {
+                enum protocol bproto, int lcore_idx) {
     conn *c;
 
     assert(sfd >= 0 && sfd < max_fds);
@@ -689,6 +694,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         STATS_UNLOCK();
 
         c->sfd = sfd;
+        c->demi_fd = (sfd / (lcore_idx + 1));
         conns[sfd] = c;
     }
 
@@ -705,13 +711,13 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         c->request_addr_size = 0;
     }
 
-    if (transport == tcp_transport && init_state == conn_new_cmd) {
-        if (getpeername(sfd, (struct sockaddr *) &c->request_addr,
-                        &c->request_addr_size)) {
-            perror("getpeername");
-            memset(&c->request_addr, 0, sizeof(c->request_addr));
-        }
-    }
+    // if (transport == tcp_transport && init_state == conn_new_cmd) {
+    //     if (getpeername(sfd, (struct sockaddr *) &c->request_addr,
+    //                     &c->request_addr_size)) {
+    //         perror("getpeername");
+    //         memset(&c->request_addr, 0, sizeof(c->request_addr));
+    //     }
+    // }
 
     if (init_state == conn_new_cmd) {
         LOGGER_LOG(NULL, LOG_CONNEVENTS, LOGGER_CONNECTION_NEW, NULL,
@@ -720,24 +726,24 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     if (settings.verbose > 1) {
         if (init_state == conn_listening) {
-            fprintf(stderr, "<%d server listening (%s)\n", sfd,
+            fprintf(stderr, "<[t%d] server listening (%s)\n", lcore_idx,
                 prot_text(c->protocol));
         } else if (IS_UDP(transport)) {
-            fprintf(stderr, "<%d server listening (udp)\n", sfd);
+            fprintf(stderr, "<[t%d] server listening (udp)\n", lcore_idx);
         } else if (c->protocol == negotiating_prot) {
-            fprintf(stderr, "<%d new auto-negotiating client connection\n",
-                    sfd);
+            fprintf(stderr, "<[t%d] new auto-negotiating client connection\n",
+                    lcore_idx);
         } else if (c->protocol == ascii_prot) {
-            fprintf(stderr, "<%d new ascii client connection.\n", sfd);
+            fprintf(stderr, "<[t%d] new ascii client connection.\n", lcore_idx);
         } else if (c->protocol == binary_prot) {
-            fprintf(stderr, "<%d new binary client connection.\n", sfd);
+            fprintf(stderr, "<[t%d] new binary client connection.\n", lcore_idx);
 #ifdef PROXY
         } else if (c->protocol == proxy_prot) {
-            fprintf(stderr, "<%d new proxy client connection.\n", sfd);
+            fprintf(stderr, "<[t%d] new proxy client connection.\n", lcore_idx);
 #endif
         } else {
-            fprintf(stderr, "<%d new unknown (%d) client connection\n",
-                sfd, c->protocol);
+            fprintf(stderr, "<[t%d] new unknown (%d) client connection\n",
+                lcore_idx, c->protocol);
             assert(false);
         }
     }
@@ -767,6 +773,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->item = 0;
 
     c->noreply = false;
+
+    c->lcore_idx = lcore_idx;
 
 #ifdef TLS
     if (ssl) {
@@ -816,7 +824,10 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
-    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
+    // For Demikernel, we need to transform Memcached to Demikernel FD
+    int new_sfd = sfd / (lcore_idx + 1);
+
+    event_set(&c->event, new_sfd, event_flags, event_handler, (void *)c);
     event_base_set(base, &c->event);
     c->ev_flags = event_flags;
 
@@ -925,7 +936,8 @@ static void conn_close(conn *c) {
     event_del(&c->event);
 
     if (settings.verbose > 1)
-        fprintf(stderr, "<%d connection closed.\n", c->sfd);
+        fprintf(stderr, "<[t%d] connection closed.\n", c->lcore_idx);
+        // fprintf(stderr, "<%d connection closed.\n", c->sfd);
 
     conn_cleanup(c);
 
@@ -1001,8 +1013,9 @@ void conn_set_state(conn *c, enum conn_states state) {
 
     if (state != c->state) {
         if (settings.verbose > 2) {
-            fprintf(stderr, "%d: going from %s to %s\n",
-                    c->sfd, state_text(c->state),
+            // fprintf(stderr, "%d: going from %s to %s\n",
+            fprintf(stderr, "[t%d]: going from %s to %s\n",
+                    c->lcore_idx, state_text(c->state),
                     state_text(state));
         }
 
@@ -1295,7 +1308,8 @@ void out_string(conn *c, const char *str) {
     }
 
     if (settings.verbose > 1)
-        fprintf(stderr, ">%d %s\n", c->sfd, str);
+        fprintf(stderr, ">[t%d] %s\n", c->lcore_idx, str);
+        // fprintf(stderr, ">%d %s\n", c->sfd, str);
 
     // Fill response object with static string.
 
@@ -2405,7 +2419,8 @@ static int try_read_command_negotiate(conn *c) {
     }
 
     if (settings.verbose > 1) {
-        fprintf(stderr, "%d: Client using the %s protocol\n", c->sfd,
+        fprintf(stderr, "[t%d]: Client using the %s protocol\n", c->lcore_idx,
+        // fprintf(stderr, "%d: Client using the %s protocol\n", c->sfd,
                 prot_text(c->protocol));
     }
 
@@ -3020,6 +3035,7 @@ static void drive_machine(conn *c) {
 #endif
 
     assert(c != NULL);
+    int demifd = c->sfd / (c->lcore_idx + 1);
 
     while (!stop) {
 
@@ -3028,12 +3044,12 @@ static void drive_machine(conn *c) {
             addrlen = sizeof(addr);
 #ifdef HAVE_ACCEPT4
             if (use_accept4) {
-                sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+                sfd = accept4(demifd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
             } else {
-                sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+                sfd = accept(demifd, (struct sockaddr *)&addr, &addrlen);
             }
 #else
-            sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+            sfd = accept(demifd, (struct sockaddr *)&addr, &addrlen);
 #endif
             if (sfd == -1) {
                 if (use_accept4 && errno == ENOSYS) {
@@ -3124,7 +3140,7 @@ static void drive_machine(conn *c) {
 #endif
 
                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
-                                     READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
+                                     READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol, c->lcore_idx);
             }
 
             stop = true;
@@ -3140,10 +3156,12 @@ static void drive_machine(conn *c) {
             }
 
             conn_set_state(c, conn_read);
-            stop = true;
-            break;
+            // stop = true;
+            // break;
+            continue;
 
         case conn_read:
+
             if (!IS_UDP(c->transport)) {
                 // Assign a read buffer if necessary.
                 if (!rbuf_alloc(c)) {
@@ -3151,6 +3169,9 @@ static void drive_machine(conn *c) {
                     conn_set_state(c, conn_closing);
                     break;
                 }
+
+                if (c->sfd > 500)
+                    c->demi_fd = c->sfd / (c->lcore_idx + 1);
                 res = try_read_network(c);
             } else {
                 // UDP connections always have a static buffer.
@@ -3160,6 +3181,7 @@ static void drive_machine(conn *c) {
             switch (res) {
             case READ_NO_DATA_RECEIVED:
                 conn_set_state(c, conn_waiting);
+                stop = true;
                 break;
             case READ_DATA_RECEIVED:
                 conn_set_state(c, conn_parse_cmd);
@@ -3450,13 +3472,13 @@ void event_handler(const evutil_socket_t fd, const short which, void *arg) {
 
     c->which = which;
 
-    /* sanity */
-    if (fd != c->sfd) {
-        if (settings.verbose > 0)
-            fprintf(stderr, "Catastrophic: event fd doesn't match conn fd!\n");
-        conn_close(c);
-        return;
-    }
+    // /* sanity */
+    // if (fd != c->sfd) {
+    //     if (settings.verbose > 0)
+    //         fprintf(stderr, "Catastrophic: event fd doesn't match conn fd!\n");
+    //     conn_close(c);
+    //     return;
+    // }
 
     drive_machine(c);
 
@@ -3529,7 +3551,7 @@ static void maximize_sndbuf(const int sfd) {
  *        when they are successfully added to the list of ports we
  *        listen on.
  */
-static int server_socket(const char *interface,
+int server_socket(const char *interface,
                          int port,
                          enum network_transport transport,
                          FILE *portnumber_file, bool ssl_enabled,
@@ -3683,12 +3705,12 @@ static int server_socket(const char *interface,
                 }
                 dispatch_conn_new(per_thread_fd, conn_read,
                                   EV_READ | EV_PERSIST,
-                                  UDP_READ_BUFFER_SIZE, transport, NULL, conntag, bproto);
+                                  UDP_READ_BUFFER_SIZE, transport, NULL, conntag, bproto, 0);
             }
         } else {
             if (!(listen_conn_add = conn_new(sfd, conn_listening,
                                              EV_READ | EV_PERSIST, 1,
-                                             transport, main_base, NULL, conntag, bproto))) {
+                                             transport, main_base, NULL, conntag, bproto, 0))) {
                 fprintf(stderr, "failed to create listening connection\n");
                 exit(EXIT_FAILURE);
             }
@@ -3944,7 +3966,7 @@ static int server_socket_unix(const char *path, int access_mask) {
     }
     if (!(listen_conn = conn_new(sfd, conn_listening,
                                  EV_READ | EV_PERSIST, 1,
-                                 local_transport, main_base, NULL, 0, settings.binding_protocol))) {
+                                 local_transport, main_base, NULL, 0, settings.binding_protocol, 0))) {
         fprintf(stderr, "failed to create listening connection\n");
         exit(EXIT_FAILURE);
     }
@@ -5996,6 +6018,7 @@ int main (int argc, char **argv) {
         fprintf(stderr, "warning: -k invalid, mlockall() not supported on this platform.  proceeding without.\n");
 #endif
     }
+    sleep(settings.num_threads);
 
     /* initialize main thread libevent instance */
 #if defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER >= 0x02000101
@@ -6197,72 +6220,72 @@ int main (int argc, char **argv) {
     clock_handler(0, 0, 0);
 
     /* create unix mode sockets after dropping privileges */
-    if (settings.socketpath != NULL) {
-        errno = 0;
-        if (server_socket_unix(settings.socketpath,settings.access)) {
-            vperror("failed to listen on UNIX socket: %s", settings.socketpath);
-            exit(EX_OSERR);
-        }
-    }
+    // if (settings.socketpath != NULL) {
+    //     errno = 0;
+    //     if (server_socket_unix(settings.socketpath,settings.access)) {
+    //         vperror("failed to listen on UNIX socket: %s", settings.socketpath);
+    //         exit(EX_OSERR);
+    //     }
+    // }
 
-    /* create the listening socket, bind it, and init */
-    if (settings.socketpath == NULL) {
-        const char *portnumber_filename = getenv("MEMCACHED_PORT_FILENAME");
-        char *temp_portnumber_filename = NULL;
-        size_t len;
-        FILE *portnumber_file = NULL;
+    // /* create the listening socket, bind it, and init */
+    // if (settings.socketpath == NULL) {
+    //     const char *portnumber_filename = getenv("MEMCACHED_PORT_FILENAME");
+    //     char *temp_portnumber_filename = NULL;
+    //     size_t len;
+    //     FILE *portnumber_file = NULL;
 
-        if (portnumber_filename != NULL) {
-            len = strlen(portnumber_filename)+4+1;
-            temp_portnumber_filename = malloc(len);
-            snprintf(temp_portnumber_filename,
-                     len,
-                     "%s.lck", portnumber_filename);
+    //     if (portnumber_filename != NULL) {
+    //         len = strlen(portnumber_filename)+4+1;
+    //         temp_portnumber_filename = malloc(len);
+    //         snprintf(temp_portnumber_filename,
+    //                  len,
+    //                  "%s.lck", portnumber_filename);
 
-            portnumber_file = fopen(temp_portnumber_filename, "a");
-            if (portnumber_file == NULL) {
-                fprintf(stderr, "Failed to open \"%s\": %s\n",
-                        temp_portnumber_filename, strerror(errno));
-            }
-        }
+    //         portnumber_file = fopen(temp_portnumber_filename, "a");
+    //         if (portnumber_file == NULL) {
+    //             fprintf(stderr, "Failed to open \"%s\": %s\n",
+    //                     temp_portnumber_filename, strerror(errno));
+    //         }
+    //     }
 
-        errno = 0;
-        if (settings.port && server_sockets(settings.port, tcp_transport,
-                                           portnumber_file)) {
-            if (settings.inter == NULL) {
-                vperror("failed to listen on TCP port %d", settings.port);
-            } else {
-                vperror("failed to listen on one of interface(s) %s", settings.inter);
-            }
-            exit(EX_OSERR);
-        }
+    //     errno = 0;
+    //     if (settings.port && server_sockets(settings.port, tcp_transport,
+    //                                        portnumber_file)) {
+    //         if (settings.inter == NULL) {
+    //             vperror("failed to listen on TCP port %d", settings.port);
+    //         } else {
+    //             vperror("failed to listen on one of interface(s) %s", settings.inter);
+    //         }
+    //         exit(EX_OSERR);
+    //     }
 
-        /*
-         * initialization order: first create the listening sockets
-         * (may need root on low ports), then drop root if needed,
-         * then daemonize if needed, then init libevent (in some cases
-         * descriptors created by libevent wouldn't survive forking).
-         */
+    //     /*
+    //      * initialization order: first create the listening sockets
+    //      * (may need root on low ports), then drop root if needed,
+    //      * then daemonize if needed, then init libevent (in some cases
+    //      * descriptors created by libevent wouldn't survive forking).
+    //      */
 
-        /* create the UDP listening socket and bind it */
-        errno = 0;
-        if (settings.udpport && server_sockets(settings.udpport, udp_transport,
-                                              portnumber_file)) {
-            if (settings.inter == NULL) {
-                vperror("failed to listen on UDP port %d", settings.udpport);
-            } else {
-                vperror("failed to listen on one of interface(s) %s", settings.inter);
-            }
-            exit(EX_OSERR);
-        }
+    //     /* create the UDP listening socket and bind it */
+    //     errno = 0;
+    //     if (settings.udpport && server_sockets(settings.udpport, udp_transport,
+    //                                           portnumber_file)) {
+    //         if (settings.inter == NULL) {
+    //             vperror("failed to listen on UDP port %d", settings.udpport);
+    //         } else {
+    //             vperror("failed to listen on one of interface(s) %s", settings.inter);
+    //         }
+    //         exit(EX_OSERR);
+    //     }
 
-        if (portnumber_file) {
-            fclose(portnumber_file);
-            rename(temp_portnumber_filename, portnumber_filename);
-        }
-        if (temp_portnumber_filename)
-            free(temp_portnumber_filename);
-    }
+    //     if (portnumber_file) {
+    //         fclose(portnumber_file);
+    //         rename(temp_portnumber_filename, portnumber_filename);
+    //     }
+    //     if (temp_portnumber_filename)
+    //         free(temp_portnumber_filename);
+    // }
 
     /* Give the sockets a moment to open. I know this is dumb, but the error
      * is only an advisory.
