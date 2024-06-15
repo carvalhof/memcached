@@ -97,7 +97,7 @@ static LIBEVENT_THREAD *threads;
 
 pthread_mutex_t global_mutex;
 pthread_cond_t global_cond;
-int ready = 0;
+static int demi_init_called = 0;
 
 /*
  * Number of worker threads that have finished setting themselves up.
@@ -584,7 +584,7 @@ int local_thread_socket(LIBEVENT_THREAD *me) {
 /*
  * Worker thread: main event loop
  */
-static void *worker_libevent(void *arg) {
+void *worker_libevent(void *arg) {
     LIBEVENT_THREAD *me = arg;
 
     sleep(0);
@@ -592,7 +592,7 @@ static void *worker_libevent(void *arg) {
     {
         // I need to wait to create the LibOS properly to start to create the new worker threads.
         pthread_mutex_lock(&global_mutex);
-        ready = 1;
+        demi_init_called = 1;
         pthread_cond_signal(&global_cond);
         pthread_mutex_unlock(&global_mutex);
     }
@@ -644,7 +644,7 @@ static void *worker_libevent(void *arg) {
     }
 
     register_thread_initialized();
-
+    usleep(100000);
     event_base_loop(me->base, 0);
 
     // same mechanism used to watch for all threads exiting.
@@ -1272,7 +1272,7 @@ void memcached_thread_init(int nthreads, void *arg) {
     pthread_cond_init(&global_cond, NULL);
 
     for (i = 0; i < nthreads; i++) {
-        ready = 0;
+        demi_init_called = 0;
 
         threads[i].lcore_idx = i;
         pthread_mutex_init(&threads[i].demi_lock, NULL);
