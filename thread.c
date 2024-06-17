@@ -1281,7 +1281,7 @@ void memcached_thread_init(int nthreads, void *arg) {
         create_worker(worker_libevent, &threads[i]);
 
         pthread_mutex_lock(&global_mutex);
-        while (!ready) {
+        while (!demi_init_called) {
             pthread_cond_wait(&global_cond, &global_mutex);
         }
         pthread_mutex_unlock(&global_mutex);
